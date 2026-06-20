@@ -1,0 +1,35 @@
+{
+  "alarm_port": {
+    "description": "告警监听端口",
+    "type": "int",
+    "hint": "插件对外暴露的 HTTP 监听端口。游戏服务器向 http://<host>:<port>/alert 推送告警。修改后需重载插件生效。",
+    "obvious_hint": true,
+    "default": 8765
+  },
+  "history_mode": {
+    "description": "会话历史携带模式",
+    "type": "string",
+    "hint": "all=携带全部历史；recent=仅携带最近 N 条；relevant=按告警关键词相关性筛选 N 条。",
+    "options": ["all", "recent", "relevant"],
+    "default": "all"
+  },
+  "history_count": {
+    "description": "历史条数 N",
+    "type": "int",
+    "hint": "history_mode 为 recent / relevant 时生效。0 表示不限制条数。",
+    "default": 0
+  },
+  "record_alert_history": {
+    "description": "将告警写入会话历史",
+    "type": "bool",
+    "hint": "开启后，每次告警会作为一条 user 记录追加到当前会话，便于后续对话与缓存命中。",
+    "default": true
+  },
+  "enable_agent_mode": {
+    "description": "启用 Agent 模式（调用 MCP 工具）",
+    "type": "bool",
+    "hint": "开启后，告警处理会使用 tool_loop_agent，让 LLM 自主决策是否调用已配置的 MCP 工具（如向游戏服务器下发命令）。关闭时退回纯文本 text_chat。",
+    "obvious_hint": true,
+    "default": false
+  }
+}
