@@ -1,24 +1,380 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+import asyncio
+import json
+import re
+from typing import Any, Dict, List, Optional
+
+import aiohttp.web as web
+
+from astrbot.api.event import MessageChain, AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+from astrbot.core.platform.astr_message_event import AstrMessageEvent as _AstrMessageEvent
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
+from astrbot.core.platform.platform_metadata import PlatformMetadata
+from astrbot.core.platform.message_type import MessageType
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+@register(
+    "astrbot_plugin_factorio_anchor",
+    "Factorio 告警锚",
+    "通过会话订阅接收游戏告警，并由 AstrBot LLM 决策后主动推送",
+    "1.0.0",
+)
+class FactorioAlarmAnchorPlugin(Star):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
+        self._subscribed_umo: Optional[str] = None
+        self._server_runner: Optional[web.AppRunner] = None
+        self._server_task: Optional[asyncio.Task[Any]] = None
+
+        self._alarm_port: int = int(config.get("alarm_port", 8765))
+        history_mode = str(config.get("history_mode", "all")).lower()
+        self._history_mode: str = history_mode if history_mode in {"all", "recent", "relevant"} else "all"
+        self._history_count: int = int(config.get("history_count", 0))
+        self._record_alert_history: bool = bool(config.get("record_alert_history", True))
+        self._enable_agent_mode: bool = bool(config.get("enable_agent_mode", False))
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        """初始化时启动告警接收服务。"""
+        self._server_task = asyncio.create_task(self._start_alert_server())
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件被卸载或停用时关闭告警服务。"""
+        if self._server_runner:
+            try:
+                await self._server_runner.cleanup()
+                logger.info("FactorioAlarmAnchor: 告警服务已关闭")
+            except Exception as exc:
+                logger.exception(f"FactorioAlarmAnchor: 关闭告警服务失败：{exc}")
+        if self._server_task and not self._server_task.done():
+            self._server_task.cancel()
+
+    async def _start_alert_server(self) -> None:
+        app = web.Application()
+        app.router.add_post("/alert", self._handle_alert)
+        app.router.add_get("/health", self._handle_health)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self._alarm_port)
+        await site.start()
+
+        self._server_runner = runner
+        logger.info(f"FactorioAlarmAnchor: 告警服务已启动，监听 0.0.0.0:{self._alarm_port}")
+
+    async def _handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "status": "running"})
+
+    async def _handle_alert(self, request: web.Request) -> web.Response:
+        if not self._subscribed_umo:
+            return web.json_response(
+                {"ok": False, "error": "当前未绑定会话，请先在目标会话中发送 /alarm_subscribe"},
+                status=400,
+            )
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "无效的 JSON 请求体"}, status=400)
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+        alert = self._normalize_alert(payload)
+        if not alert:
+            return web.json_response({"ok": False, "error": "告警数据缺失或格式不正确"}, status=400)
+
+        result_text = await self._process_alert(alert)
+        return web.json_response({"ok": True, "result": result_text})
+
+    def _normalize_alert(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return None
+
+        alert_name = payload.get("alert_name") or payload.get("name") or payload.get("title")
+        severity = payload.get("severity") or payload.get("level") or "unknown"
+        message = payload.get("message") or payload.get("content") or payload.get("text")
+        source = payload.get("source") or payload.get("origin") or payload.get("instance")
+        timestamp = payload.get("timestamp") or payload.get("time") or payload.get("date")
+
+        if not alert_name or not message:
+            return None
+
+        return {
+            "alert_name": str(alert_name),
+            "severity": str(severity),
+            "message": str(message),
+            "source": str(source) if source is not None else "unknown",
+            "timestamp": str(timestamp) if timestamp is not None else "unknown",
+        }
+
+    async def _process_alert(self, alert: Dict[str, str]) -> str:
+        history_text = await self._get_session_history(self._subscribed_umo, alert)
+        llm_text = None
+
+        if self._enable_agent_mode:
+            llm_text = await self._process_alert_agent(alert, history_text)
+        else:
+            llm_text = await self._process_alert_text_chat(alert, history_text)
+
+        message = self._build_push_message(alert, llm_text)
+        await self._send_to_subscribed_session(message)
+        if self._record_alert_history:
+            await self._append_alert_to_history(alert)
+        return message
+
+    async def _process_alert_text_chat(self, alert: Dict[str, str], history_text: str) -> Optional[str]:
+        provider = self.context.get_using_provider(umo=self._subscribed_umo)
+        if not provider:
+            logger.warning("FactorioAlarmAnchor: 获取当前会话 LLM 提供商失败，将直接发送告警摘要")
+            return None
+        try:
+            response = await provider.text_chat(
+                prompt=self._build_llm_prompt(alert, history_text),
+                context=[],
+                system_prompt="你是一个运维告警助手，收到游戏告警后要优先判断是否需要提醒用户以及建议下一步操作。请依据告警信息和当前会话历史给出简明结论和建议，返回适合直接发送给用户的中文内容。",
+            )
+            llm_text = getattr(response, "completion_text", None)
+            if not llm_text:
+                llm_text = getattr(response, "text", None)
+            if not llm_text and response is not None:
+                llm_text = str(response)
+            return llm_text
+        except Exception as exc:
+            logger.exception(f"FactorioAlarmAnchor: 调用 LLM 失败：{exc}")
+            return None
+
+    async def _process_alert_agent(self, alert: Dict[str, str], history_text: str) -> Optional[str]:
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(self._subscribed_umo)
+        except Exception as exc:
+            logger.warning(f"FactorioAlarmAnchor: 获取 provider_id 失败，退回 text_chat：{exc}")
+            return await self._process_alert_text_chat(alert, history_text)
+
+        try:
+            synthetic_event = self._make_synthetic_event(self._subscribed_umo)
+            response = await self.context.tool_loop_agent(
+                event=synthetic_event,
+                chat_provider_id=provider_id,
+                prompt=self._build_llm_prompt(alert, history_text),
+                system_prompt="你是一个 Factorio 游戏服务器运维助手。收到告警后，先判断严重程度，再决定是否需要调用 MCP 工具向游戏服务器下发命令（如踢人、暂停、广播消息等）。最终给出简明中文结论和已执行的操作摘要。",
+                max_steps=10,
+                tool_call_timeout=30,
+            )
+            llm_text = getattr(response, "completion_text", None)
+            if not llm_text and response is not None:
+                llm_text = str(response)
+            return llm_text
+        except Exception as exc:
+            logger.exception(f"FactorioAlarmAnchor: Agent 调用失败：{exc}")
+            return None
+
+    def _make_synthetic_event(self, unified_msg_origin: str) -> _AstrMessageEvent:
+        # Parse platform_name:message_type:session_id from the stored umo string.
+        parts = unified_msg_origin.split(":", 2)
+        platform_name = parts[0] if len(parts) > 0 else "unknown"
+        session_id = parts[2] if len(parts) > 2 else unified_msg_origin
+
+        platform_meta = PlatformMetadata(
+            name=platform_name,
+            description="synthetic event for alarm agent",
+            id=platform_name,
+        )
+
+        msg_obj = AstrBotMessage()
+        msg_obj.type = MessageType.FRIEND_MESSAGE
+        msg_obj.self_id = "alarm_anchor"
+        msg_obj.session_id = session_id
+        msg_obj.message_id = "alarm_anchor_synthetic"
+        msg_obj.message = []
+        msg_obj.message_str = ""
+        msg_obj.raw_message = None
+        sender = MessageMember(user_id=session_id, nickname="alarm_anchor")
+        msg_obj.sender = sender
+
+        class _SyntheticEvent(_AstrMessageEvent):
+            def get_platform_name(self_):
+                return platform_name
+            def get_message_outline(self_) -> str:
+                return ""
+            def get_group_id(self_) -> str:
+                return ""
+            def get_sender_id(self_) -> str:
+                return session_id
+            def get_sender_name(self_) -> str:
+                return "alarm_anchor"
+
+        event = _SyntheticEvent(
+            message_str="",
+            message_obj=msg_obj,
+            platform_meta=platform_meta,
+            session_id=session_id,
+        )
+        # Override session to preserve the exact original umo string.
+        event.unified_msg_origin = unified_msg_origin
+        return event
+
+    async def _get_session_history(self, unified_msg_origin: Optional[str], alert: Dict[str, str]) -> str:
+        if not unified_msg_origin:
+            return ""
+
+        try:
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(unified_msg_origin)
+            if curr_cid and hasattr(conv_mgr, "get_human_readable_context"):
+                try:
+                    pages, _ = await conv_mgr.get_human_readable_context(unified_msg_origin, curr_cid)
+                    if pages:
+                        lines = [line for line in "\n".join(pages).splitlines() if line.strip()]
+                        return "\n".join(self._filter_history_by_scope(lines, alert))
+                except Exception:
+                    pass
+
+            if curr_cid:
+                conversation = await conv_mgr.get_conversation(unified_msg_origin, curr_cid)
+                if conversation and getattr(conversation, "history", None):
+                    history = conversation.history
+                    if isinstance(history, str):
+                        try:
+                            parsed = json.loads(history)
+                            if isinstance(parsed, list):
+                                lines = []
+                                for item in parsed[-20:]:
+                                    if isinstance(item, dict):
+                                        role = item.get("role") or item.get("type") or ""
+                                        content = item.get("content") or item.get("text") or ""
+                                        if role or content:
+                                            lines.append(f"{role}: {content}".strip())
+                                    else:
+                                        lines.append(str(item))
+                                return "\n".join(self._filter_history_by_scope(lines, alert))
+                        except json.JSONDecodeError:
+                            lines = [line for line in history[-2000:].splitlines() if line.strip()]
+                            return "\n".join(self._filter_history_by_scope(lines, alert))
+                    return str(history)
+        except Exception as exc:
+            logger.warning(f"FactorioAlarmAnchor: 读取会话历史失败：{exc}")
+        return ""
+
+    def _filter_history_by_scope(self, lines: List[str], alert: Dict[str, str]) -> List[str]:
+        if self._history_mode == "recent":
+            return lines[-self._history_count :] if self._history_count > 0 else lines
+
+        if self._history_mode == "relevant":
+            keywords = set(re.findall(r"\w+", " ".join([alert.get("alert_name", ""), alert.get("message", ""), alert.get("source", "")]).lower()))
+            scored: List[tuple[int, int, str]] = []
+            for idx, line in enumerate(lines):
+                score = sum(1 for kw in keywords if kw and kw in line.lower())
+                scored.append((score, idx, line))
+            scored.sort(key=lambda item: (-item[0], -item[1]))
+            selected = scored[: self._history_count] if self._history_count > 0 else [item for item in scored if item[0] > 0]
+            if not selected:
+                selected = scored[: self._history_count] if self._history_count > 0 else scored
+            selected.sort(key=lambda item: item[1])
+            return [item[2] for item in selected]
+
+        return lines
+
+    async def _append_alert_to_history(self, alert: Dict[str, str]) -> None:
+        if not self._subscribed_umo:
+            return
+        try:
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(self._subscribed_umo)
+            if not curr_cid:
+                return
+
+            conversation = await conv_mgr.get_conversation(self._subscribed_umo, curr_cid)
+            if conversation is None:
+                return
+
+            history_list: List[Dict[str, Any]] = []
+            if isinstance(conversation.history, str) and conversation.history:
+                try:
+                    parsed = json.loads(conversation.history)
+                    if isinstance(parsed, list):
+                        history_list = parsed
+                except json.JSONDecodeError:
+                    history_list = [{"role": "system", "content": conversation.history}]
+
+            alert_entry = {
+                "role": "user",
+                "content": f"Factorio 告警：{alert['alert_name']}，等级：{alert['severity']}，来源：{alert['source']}，时间：{alert['timestamp']}，内容：{alert['message']}",
+            }
+            history_list.append(alert_entry)
+            await conv_mgr.update_conversation(
+                unified_msg_origin=self._subscribed_umo,
+                conversation_id=curr_cid,
+                history=history_list,
+            )
+        except Exception as exc:
+            logger.warning(f"FactorioAlarmAnchor: 记录告警到会话历史失败：{exc}")
+
+    def _build_llm_prompt(self, alert: Dict[str, str], history_text: str = "") -> str:
+        prompt = ""
+        if history_text:
+            prompt += (
+                "当前会话历史：\n"
+                f"{history_text}\n\n"
+                "请结合上述会话历史和告警信息，判断是否需要立即处理，并给出一个简明优先级建议。\n\n"
+            )
+        prompt += (
+            f"告警名称：{alert['alert_name']}\n"
+            f"告警等级：{alert['severity']}\n"
+            f"告警来源：{alert['source']}\n"
+            f"告警时间：{alert['timestamp']}\n"
+            f"告警内容：{alert['message']}\n\n"
+            "请直接返回一句简短的中文结论，说明是否需要立即处理，并给出一个优先级建议。"
+        )
+        return prompt
+
+    def _build_push_message(self, alert: Dict[str, str], llm_text: Optional[str]) -> str:
+        lines = [
+            "【Factorio 告警】",
+            f"告警：{alert['alert_name']}",
+            f"等级：{alert['severity']}",
+            f"建议：{llm_text.strip() if llm_text else '未获取到建议'}",
+        ]
+        if alert.get("source"):
+            lines.insert(3, f"来源：{alert['source']}")
+        return "\n".join(lines)
+
+    async def _send_to_subscribed_session(self, message: str) -> None:
+        if not self._subscribed_umo:
+            logger.warning("FactorioAlarmAnchor: 未绑定会话，无法推送告警")
+            return
+
+        chain = MessageChain().message(message)
+        try:
+            await self.context.send_message(self._subscribed_umo, chain)
+        except Exception as exc:
+            logger.exception(f"FactorioAlarmAnchor: 发送告警消息失败：{exc}")
+
+    @filter.command("alarm_subscribe")
+    async def alarm_subscribe(self, event: AstrMessageEvent):
+        """将当前会话绑定为告警推送目标。"""
+        self._subscribed_umo = event.unified_msg_origin
+        logger.info(f"FactorioAlarmAnchor: 订阅成功，绑定会话 {self._subscribed_umo}")
+        yield event.plain_result(
+            "已将当前会话绑定为告警推送目标。\n"
+            f"请使用 POST /alert 向插件发送告警数据，服务地址: http://<host>:{self._alarm_port}/alert"
+        )
+
+    @filter.command("alarm_unsubscribe")
+    async def alarm_unsubscribe(self, event: AstrMessageEvent):
+        """取消当前会话的告警推送绑定。"""
+        if event.unified_msg_origin == self._subscribed_umo:
+            self._subscribed_umo = None
+            logger.info("FactorioAlarmAnchor: 取消绑定会话")
+            yield event.plain_result("已取消告警推送订阅。")
+        else:
+            yield event.plain_result("当前会话未绑定为告警推送目标，无法取消。")
+
+    @filter.command("alarm_subscribe_status")
+    async def alarm_subscribe_status(self, event: AstrMessageEvent):
+        """查询当前告警推送绑定状态。"""
+        if self._subscribed_umo:
+            yield event.plain_result(
+                f"当前已绑定告警目标会话：{self._subscribed_umo}\n"
+                f"告警推送地址：http://<host>:{self._alarm_port}/alert"
+            )
+        else:
+            yield event.plain_result("当前未绑定任何告警推送会话。请在目标会话中发送 /alarm_subscribe 进行绑定。")
