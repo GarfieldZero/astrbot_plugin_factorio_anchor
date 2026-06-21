@@ -12,6 +12,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent as _AstrMe
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.platform.message_type import MessageType
+from astrbot.core.agent.tool import ToolSet
 
 @register(
     "astrbot_plugin_factorio_anchor",
@@ -184,16 +185,59 @@ class FactorioAlarmAnchorPlugin(Star):
             return await self._process_alert_text_chat(alert, history_text)
 
         try:
+            # 获取全局工具管理器（包含所有已注册的工具，包括 MCP 工具）
+            tool_mgr = self.context.get_llm_tool_manager()
+
+            # 诊断日志：检查可用工具
+            tools_to_use = None
+            try:
+                if hasattr(tool_mgr, 'func_list'):
+                    all_tools = tool_mgr.func_list
+                    logger.info(f"FactorioAlarmAnchor: 全局工具数量: {len(all_tools)}")
+                    tool_names = [getattr(t, 'name', 'unknown') for t in all_tools]
+                    logger.info(f"FactorioAlarmAnchor: 可用工具列表: {', '.join(tool_names[:10])}{'...' if len(tool_names) > 10 else ''}")
+
+                    # 将 FunctionToolManager 转换为 ToolSet
+                    tools_to_use = ToolSet(all_tools)
+                    logger.debug(f"FactorioAlarmAnchor: 已将工具列表转换为 ToolSet")
+                else:
+                    logger.info(f"FactorioAlarmAnchor: 工具管理器类型: {type(tool_mgr)}")
+                    tools_to_use = tool_mgr
+            except Exception as diag_exc:
+                logger.warning(f"FactorioAlarmAnchor: 工具诊断失败: {diag_exc}")
+                tools_to_use = None
+
             synthetic_event = self._make_synthetic_event(self._subscribed_umo)
             prompt = self._build_llm_prompt(alert, history_text)
             logger.debug(f"FactorioAlarmAnchor: 构建 Agent 提示词，长度: {len(prompt)} 字符")
-            logger.info("FactorioAlarmAnchor: 开始调用 tool_loop_agent，max_steps=10，timeout=30")
+            logger.info(f"FactorioAlarmAnchor: 开始调用 tool_loop_agent，max_steps=10，timeout=30，tools={'有' if tools_to_use else '无'}")
+
+            # 优化的 system prompt，明确告诉 LLM 何时调用工具
+            system_prompt = """你是一个 Factorio 游戏服务器运维助手。
+
+收到告警后的处理流程：
+1. 首先分析告警的严重程度和类型
+2. **对于 warning 或 critical 级别的告警**：
+   - 调用 get_current_signals 查看所有探针的实时信号状态
+   - 根据需要调用 get_probe_config 查看探针配置和阈值
+   - 如果需要干预，调用 send_command 向游戏服务器下发控制信号
+3. **对于 info 级别的告警**：可以直接给出建议，不必调用工具
+4. 最后用中文给出简明的结论和已执行的操作摘要
+
+可用的 MCP 工具示例：
+- get_current_signals: 获取所有探针的实时信号快照
+- get_probe_config: 获取探针配置和阈值规则
+- send_command: 通过 RCON 向游戏内探针下发控制信号
+- get_history_records: 查询历史信号记录
+
+注意：主动使用工具来确认状态，而不是仅凭告警信息猜测。"""
 
             response = await self.context.tool_loop_agent(
                 event=synthetic_event,
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt="你是一个 Factorio 游戏服务器运维助手。收到告警后，先判断严重程度，再决定是否需要调用 MCP 工具向游戏服务器下发命令（如踢人、暂停、广播消息等）。最终给出简明中文结论和已执行的操作摘要。",
+                system_prompt=system_prompt,
+                tools=tools_to_use,  # ✅ 传入 ToolSet 对象，让 Agent 知道有哪些工具可用
                 max_steps=10,
                 tool_call_timeout=30,
             )
@@ -499,6 +543,18 @@ class FactorioAlarmAnchorPlugin(Star):
             curr_cid = "获取失败"
             history_count = "获取失败"
 
+        # 检查可用工具
+        tool_info = "未检测到"
+        tool_names = []
+        try:
+            tool_mgr = self.context.get_llm_tool_manager()
+            if hasattr(tool_mgr, 'func_list'):
+                all_tools = tool_mgr.func_list
+                tool_info = f"{len(all_tools)} 个"
+                tool_names = [getattr(t, 'name', 'unknown') for t in all_tools[:10]]
+        except Exception as e:
+            tool_info = f"获取失败: {str(e)}"
+
         debug_info = (
             f"【插件调试信息】\n"
             f"订阅会话: {self._subscribed_umo or '未绑定'}\n"
@@ -512,5 +568,10 @@ class FactorioAlarmAnchorPlugin(Star):
             f"Provider ID: {provider_id}\n"
             f"对话 ID: {curr_cid}\n"
             f"历史记录数: {history_count}\n"
+            f"可用工具数: {tool_info}\n"
         )
+
+        if tool_names:
+            debug_info += f"工具列表: {', '.join(tool_names)}{'...' if len(tool_names) >= 10 else ''}\n"
+
         yield event.plain_result(debug_info)

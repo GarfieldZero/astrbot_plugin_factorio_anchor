@@ -1,79 +1,181 @@
-# Factorio 告警锚 插件
+# AstrBot Factorio 告警锚插件
 
-Factorio 告警锚插件用于接收游戏服务器推送的告警，并把告警内容传递给 AstrBot 会话对应的 LLM，由模型判断并给出处理建议，最终通过消息平台主动推送至订阅用户。
+[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)](CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## 功能说明
+通过会话订阅接收 Factorio 游戏服务器的告警推送，结合 LLM 智能决策并主动推送给用户。
 
-- 启动时自动创建 HTTP 接口 `POST /alert`，默认监听端口：`8765`
-- 支持客户端通过会话命令 `/alarm_subscribe` 绑定当前会话为告警接收目标
-- 支持 `/alarm_unsubscribe` 取消绑定
-- 支持 `/alarm_subscribe_status` 查询当前绑定状态
-- 告警会携带订阅会话的 `unified_msg_origin` 触发 AstrBot LLM 提供商，从而命中会话上下文并减少无关开销
+## ✨ 功能特性
 
-## 快速上手
+- 🚨 **智能告警推送**：接收游戏告警，携带会话历史让 LLM 分析并推送建议
+- 🤖 **Agent 模式**：LLM 可自主调用 MCP 工具查询状态、下发控制指令
+- 📝 **历史记录**：告警和响应自动存入会话历史，便于后续对话
+- 🎯 **灵活配置**：支持三种历史携带模式（all/recent/relevant）
 
-1. 将插件放入 AstrBot 插件目录
-2. 在目标消息会话中发送：`/alarm_subscribe`
-3. 在游戏服务器中向插件所在主机发送告警请求：
+## 🚀 快速开始
+
+### 1. 安装插件
+
+```bash
+# 将插件放入 AstrBot 插件目录
+cd AstrBot/data/plugins
+git clone <your-repo-url> astrbot_plugin_factorio_anchor
+
+# 安装依赖
+cd astrbot_plugin_factorio_anchor
+pip install -r requirements.txt
+```
+
+### 2. 配置插件
+
+在 AstrBot 管理面板中配置：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| alarm_port | 8765 | 告警监听端口 |
+| enable_agent_mode | false | 是否启用 Agent 模式（MCP 工具调用） |
+| record_alert_history | true | 是否记录告警到会话历史 |
+| history_mode | all | 会话历史模式：all/recent/relevant |
+| history_count | 0 | 历史条数限制（0=不限制） |
+
+### 3. 订阅告警
+
+在目标会话中发送：
+
+```
+/alarm_subscribe
+```
+
+### 4. 推送告警
+
+游戏服务器向插件发送 POST 请求：
 
 ```bash
 curl -X POST http://<host>:8765/alert \
   -H "Content-Type: application/json" \
-  -d '{"alert_name":"Factorio 服务器异常","severity":"critical","message":"游戏服务器异常退出","source":"factorio-01","timestamp":"2026-06-20T12:34:56Z"}'
+  -d '{
+    "alert_name": "铁板库存告警",
+    "severity": "warning",
+    "source": "熔炉区",
+    "message": "库存 5200 超过阈值 5000"
+  }'
 ```
 
-4. 目标会话会收到包含告警信息与 LLM 建议的主动消息
+## 🎮 Agent 模式（MCP 工具）
 
-## 接口说明
+启用 `enable_agent_mode` 后，LLM 可以调用 MCP 工具：
 
-### `POST /alert`
+- `get_current_signals` - 获取实时信号
+- `get_probe_config` - 查看探针配置
+- `send_command` - 下发控制指令
+- `get_history_records` - 查询历史记录
+- 更多工具...
 
-JSON 请求体示例：
+**配置 MCP 服务器**（在 AstrBot 主配置中）：
 
 ```json
 {
-  "alert_name": "游戏服务器崩溃",
-  "severity": "critical",
-  "message": "Factorio 服务器出现致命错误，正在重启",
-  "source": "factorio-server-01",
-  "timestamp": "2026-06-20T12:34:56Z"
+  "mcp_servers": {
+    "factorio": {
+      "transport": "sse",
+      "url": "http://<game-server>:8081/sse"
+    }
+  }
 }
 ```
 
-如果当前插件未绑定会话，则返回错误。
+## 📋 指令列表
 
-## 插件配置
+| 指令 | 说明 |
+|------|------|
+| `/alarm_subscribe` | 绑定当前会话为告警目标 |
+| `/alarm_unsubscribe` | 取消订阅 |
+| `/alarm_subscribe_status` | 查询绑定状态 |
+| `/alarm_test` | 发送测试告警 ⭐ |
+| `/alarm_debug` | 查看配置和工具状态 ⭐ |
 
-可在 AstrBot 插件配置中设置：
+## 🔧 故障排查
 
-```yaml
-alarm_port: 8765
-```
-可选配置项：
-
-```yaml
-alarm_port: 8765
-history_mode: all         # all / recent / relevant
-history_count: 0         # 限制历史条数，0 表示不限制
-record_alert_history: true
-```
-
-配置说明：
-
-- `alarm_port`：告警接收 HTTP 服务监听端口。
-- `history_mode`：历史上下文选择策略，
-  - `all`：全部历史；
-  - `recent`：只取最近若干条；
-  - `relevant`：优先取与当前告警关键词相关的消息。
-- `history_count`：在 `recent` 或 `relevant` 模式下限制历史条数；0 表示不限制。
-- `record_alert_history`：是否将本次告警内容写入当前会话历史，以便后续对话能够引用。
-
-## 依赖
-
-- aiohttp
-
-## 安装依赖
+### 快速诊断
 
 ```bash
-pip install -r requirements.txt
+# 1. 查看配置和工具状态
+/alarm_debug
+
+# 2. 发送测试告警
+/alarm_test
+
+# 3. 查看日志
+# 应该看到：
+# ✓ 全局工具数量: 9
+# ✓ 已将工具列表转换为 ToolSet
+# ✓ 成功记录告警和响应到会话历史
 ```
+
+### 常见问题
+
+**Q: Agent 不调用工具？**
+- 确认 `enable_agent_mode` 为 `true`
+- 运行 `/alarm_debug` 查看工具数量是否 > 0
+- 检查 MCP 服务器是否在 AstrBot 主配置中正确配置
+
+**Q: 告警未推送？**
+- 确认已运行 `/alarm_subscribe`
+- 测试端点：`curl http://<host>:<port>/health`
+
+**Q: 历史未保存？**
+- 确认 `record_alert_history` 为 `true`
+- 查看日志中是否有 "成功记录告警和响应"
+
+## 📦 项目结构
+
+```
+astrbot_plugin_factorio_anchor/
+├── main.py                 # 插件主文件
+├── mcp_server.py          # MCP 网关（游戏服务器端）
+├── metadata.yaml          # 插件元数据
+├── _conf_schema.json      # 配置模板
+├── requirements.txt       # Python 依赖
+├── README.md             # 本文档
+├── CHANGELOG.md          # 更新历史
+└── docs/                 # AstrBot 开发文档
+```
+
+## 🎯 工作流程
+
+```
+游戏服务器
+    ↓ 信号文件
+MCP 网关
+    ↓ 阈值检查
+    ↓ HTTP POST
+AstrBot 插件
+    ↓ 携带历史
+    ↓ LLM 分析
+    ↓ 工具调用
+推送到用户
+```
+
+## 📝 更新日志
+
+查看 [CHANGELOG.md](CHANGELOG.md) 了解版本历史。
+
+**最新版本 v1.0.1 (2026-06-21)**：
+- ✅ 修复 LLM 响应存储问题
+- ✅ 修复 Agent 工具调用问题
+- ✅ 新增测试和调试命令
+- ✅ 增强日志输出
+
+## 📄 许可证
+
+[MIT License](LICENSE)
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+---
+
+**开发者**: 您的名字  
+**文档版本**: v1.0.1  
+**更新时间**: 2026-06-21
