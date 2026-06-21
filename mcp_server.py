@@ -71,21 +71,24 @@ def save_config():
 
 # ============ 阈值检查与故障推送 ============
 _OPS = {
-    ">":  lambda v, t: v > t,
-    "<":  lambda v, t: v < t,
-    ">=": lambda v, t: v >= t,
-    "<=": lambda v, t: v <= t,
-    "==": lambda v, t: v == t,
+    ">":   lambda v, t: v > t,
+    "<":   lambda v, t: v < t,
+    ">=":  lambda v, t: v >= t,
+    "<=":  lambda v, t: v <= t,
+    "==":  lambda v, t: v == t,
+    "gt":  lambda v, t: v > t,
+    "lt":  lambda v, t: v < t,
+    "gte": lambda v, t: v >= t,
+    "lte": lambda v, t: v <= t,
+    "eq":  lambda v, t: v == t,
 }
 
-def _check_threshold(value: int, threshold: Dict[str, Any]) -> bool:
-    """判断单条信号值是否触发阈值。
+def _resolve_op(threshold: Dict[str, Any]) -> str:
+    """从 threshold 中读取运算符，兼容 'op' 和 'operator' 两种字段名。"""
+    return threshold.get("op") or threshold.get("operator", ">")
 
-    threshold 格式示例:
-      {"op": ">", "value": 100, "severity": "warning", "message": "库存过高"}
-    op 支持: > < >= <= ==
-    """
-    op = threshold.get("op", ">")
+def _check_threshold(value: int, threshold: Dict[str, Any]) -> bool:
+    op = _resolve_op(threshold)
     limit = threshold.get("value")
     if limit is None:
         return False
@@ -147,8 +150,6 @@ def check_thresholds_and_push(signals: List[Dict[str, Any]]) -> None:
         if un is not None:
             unit_map[int(un)] = (pid, pcfg)
 
-    loop = asyncio.get_event_loop()
-
     for node in signals:
         unit = node.get("unit_number")
         if unit is None:
@@ -183,14 +184,9 @@ def check_thresholds_and_push(signals: List[Dict[str, Any]]) -> None:
 
                 _mark_sent(alert_key)
                 print(f"🚨 阈值触发: {probe_name} / {sig_name} = {sig_value}，准备推送告警")
-                if loop.is_running():
-                    asyncio.ensure_future(
-                        _push_alert(probe_name, probe_id, sig_label, sig_name, sig_value, rule)
-                    )
-                else:
-                    loop.run_until_complete(
-                        _push_alert(probe_name, probe_id, sig_label, sig_name, sig_value, rule)
-                    )
+                asyncio.run(
+                    _push_alert(probe_name, probe_id, sig_label, sig_name, sig_value, rule)
+                )
 
 # ============ 历史数据保存 ============
 def save_history_data():
@@ -233,7 +229,7 @@ class FactorioSignalHandler(FileSystemEventHandler):
                         return
                     current_signals = json.loads(content)
                     last_update_time = time.time()
-                    print(f"✅ 加载了 {len(current_signals)} 个探针信号")
+                    # print(f"✅ 加载了 {len(current_signals)} 个探针信号")
                     check_thresholds_and_push(current_signals)
                 break
             except Exception as e:
@@ -316,12 +312,23 @@ def main():
     # 现在创建 MCP 服务器 - 因为需要 host 和 port 参数
     mcp = FastMCP("Factorio AI Gateway")
     
-    # ============ MCP 工具 - 获取信号 ============
+    # ============ MCP 工具 ============
     @mcp.tool()
     def get_current_signals() -> str:
-        """获取当前所有探针的信号数据
-        
-        返回所有探针的红/绿信号信息
+        """获取 Factorio 游戏中所有电路网络探针的实时信号快照。
+
+        返回每个探针的红色回路信号和绿色回路信号，信号值为整数（Factorio 原生单位）。
+        信号名称使用 Factorio 内部 item/fluid/signal 名称，例如 "iron-plate"、"copper-plate"、"electric-power"。
+
+        典型工作流：
+          1. 先调用本工具获取当前所有信号值；
+          2. 再调用 get_probe_config 确认对应探针的阈值配置；
+          3. 如需干预，调用 send_command 向目标探针下发控制信号。
+
+        返回格式（每个探针一段，以 --- 分隔）：
+          探针: <名称> (ID: <unit_number>)
+          红色信号: {"iron-plate": 500, ...}
+          绿色信号: {"energy": 100, ...}
         """
         if not current_signals:
             return "当前没有信号数据"
@@ -347,9 +354,24 @@ def main():
 
     @mcp.tool()
     def get_probe_config() -> str:
-        """获取所有探针的配置信息
-        
-        返回探针的名称、描述、阈值配置等
+        """获取所有探针的配置信息，包括阈值规则。
+
+        返回每个探针的名称、描述、对应的游戏 unit_number，以及阈值告警规则。
+
+        阈值规则格式说明：
+          键名支持两种形式：
+            - 纯信号名：  "iron-plate"          （匹配红/绿任意回路）
+            - 带前缀：    "red:iron-plate"       （仅匹配红色回路）
+                         "green:energy"          （仅匹配绿色回路）
+          值为规则对象：
+            {
+              "op":       ">",           // 比较运算符，支持 > < >= <= ==
+              "value":    5000,          // 阈值（整数）
+              "severity": "warning",     // 告警等级，建议 info / warning / critical
+              "message":  "铁板库存过高"  // 可选，附加说明
+            }
+
+        如需修改阈值，请调用 update_probe_config。
         """
         if not current_config:
             return "当前没有配置数据"
@@ -400,14 +422,23 @@ Unit Number: {config.get('unit_number', '')}
     
     @mcp.tool()
     async def send_command(unit_number: int, signals: List[Dict[str, Any]]) -> str:
-        """向 Factorio 游戏发送控制指令
-        
+        """通过 RCON 向 Factorio 游戏内的指定探针写入控制信号。
+
+        这是唯一能直接影响游戏运行状态的工具，调用前请确认：
+          1. 目标探针的 unit_number（可从 get_current_signals 或 get_probe_config 获取）；
+          2. 信号名称使用 Factorio 内部名称（如 "iron-plate"、"signal-red"）；
+          3. count 为整数，负值也合法（Factorio 电路信号支持负数）。
+
         Args:
-            unit_number: 目标探针的 unit number
-            signals: 要发送的信号列表，每个信号包含 type, name, count
-        
+            unit_number: 目标探针的游戏内唯一编号（unit_number），不是配置文件中的 probe_id 字符串。
+            signals: 要写入的信号列表，每项格式为：
+                       {"type": "item"|"fluid"|"virtual", "name": "<信号名>", "count": <整数>}
+                     示例：
+                       [{"type": "item", "name": "iron-plate", "count": -1000}]
+                       [{"type": "virtual", "name": "signal-red", "count": 1}]
+
         Returns:
-            发送结果信息
+            RCON 执行结果文本；若连接失败或认证错误会返回具体错误信息。
         """
         try:
             json_str = json.dumps(signals)
@@ -427,10 +458,10 @@ Unit Number: {config.get('unit_number', '')}
 
     @mcp.tool()
     def get_history_summary() -> str:
-        """获取历史数据总览
-        
-        Returns:
-            历史数据统计信息
+        """查询本地 SQLite 数据库中的历史信号记录总条数。
+
+        适合在分析趋势前先了解数据量规模，再决定查询参数（limit/offset）。
+        若总数为 0，说明数据库尚未收到任何探针数据，请检查文件监控是否正常运行。
         """
         try:
             conn = sqlite3.connect(DB_FILE)
@@ -451,16 +482,28 @@ Unit Number: {config.get('unit_number', '')}
         limit: int = 100,
         offset: int = 0
     ) -> str:
-        """获取历史数据记录
-        
+        """从本地数据库查询历史信号记录，支持按探针和信号名过滤。
+
+        历史记录每隔约 30 秒自动写入一次，可用于分析信号趋势、判断告警是否持续。
+
         Args:
-            unit_number: 探针ID (可选)
-            signal_name: 信号名称 (可选)
-            limit: 返回数量限制，默认 100
-            offset: 偏移量，默认 0
-        
-        Returns:
-            历史记录列表
+            unit_number: 按探针的游戏 unit_number 过滤（可选）。
+                         不填则返回所有探针的记录。
+            signal_name: 按信号名精确匹配过滤（可选），如 "iron-plate"。
+                         不填则返回所有信号。
+            limit:  每次最多返回条数，默认 100，建议不超过 500 避免响应过大。
+            offset: 分页偏移量，默认 0（最新记录在前）。
+
+        返回 JSON 数组，每条记录结构：
+          {
+            "id":          <自增主键>,
+            "timestamp":   <Unix 时间戳（秒）>,
+            "datetime":    "<ISO 8601 时间字符串>",
+            "unit_number": <探针 unit_number>,
+            "signal_type": "red" | "green",
+            "signal_name": "<信号名>",
+            "value":       <整数值>
+          }
         """
         try:
             conn = sqlite3.connect(DB_FILE)
@@ -507,14 +550,34 @@ Unit Number: {config.get('unit_number', '')}
 
     @mcp.tool()
     def update_probe_config(probe_id: str, config_updates: Dict[str, Any]) -> str:
-        """更新探针配置
-        
+        """新建或更新一个探针的配置，并立即持久化到 ai_config.json。
+
+        若 probe_id 不存在，会自动创建一条空白配置后再写入。
+
         Args:
-            probe_id: 探针ID
-            config_updates: 要更新的配置字段，可以包含 name, description, unit_number, thresholds
-        
+            probe_id: 配置文件中的探针标识符（字符串 key），自定义命名，如 "furnace_01"。
+                      与游戏内 unit_number 不同——unit_number 是游戏分配的数字，
+                      probe_id 是你在配置文件里给这个探针起的别名。
+            config_updates: 要更新的字段，支持以下 key（只需传需要修改的字段）：
+                "name"        (str)  — 探针显示名称，用于告警推送时的可读标识
+                "description" (str)  — 备注说明
+                "unit_number" (int)  — 与游戏内探针绑定的 unit_number
+                "thresholds"  (dict) — 阈值规则字典，格式见 get_probe_config 的说明。
+                                       传入会整体替换旧的 thresholds，请带上全部规则。
+
+        示例——为 furnace_01 设置铁板库存上限告警：
+          probe_id = "furnace_01"
+          config_updates = {
+            "name": "熔炉区探针",
+            "unit_number": 39,
+            "thresholds": {
+              "iron-plate": {"op": ">", "value": 5000, "severity": "warning", "message": "铁板堆积，请检查下游"},
+              "red:signal-red": {"op": "==", "value": 1, "severity": "critical", "message": "紧急停机信号"}
+            }
+          }
+
         Returns:
-            更新结果信息
+            操作结果文本；配置写入失败时返回错误详情。
         """
         try:
             if probe_id not in current_config:
@@ -538,10 +601,16 @@ Unit Number: {config.get('unit_number', '')}
 
     @mcp.tool()
     def get_system_status() -> str:
-        """获取系统状态信息
-        
-        Returns:
-            系统健康状态和统计信息
+        """获取 MCP 网关服务的运行状态概览。
+
+        返回以下信息：
+          - 服务运行状态（始终为"运行中"，因为能收到工具调用说明服务正常）
+          - 最后一次成功读取信号文件的时间（若长时间未更新，说明文件监控或游戏端可能异常）
+          - 当前内存中持有的探针信号数（对应游戏中正在上报数据的探针数量）
+          - 已配置阈值规则的探针数（已在 ai_config.json 中登记的探针数量）
+
+        建议在处理告警前先调用本工具，确认数据是最新的。
+        若"最后更新时间"距今超过 5 分钟，优先排查游戏端脚本或文件监控是否正常。
         """
         return f"""
 系统状态: 运行中
@@ -549,6 +618,40 @@ Unit Number: {config.get('unit_number', '')}
 当前连接探针数: {len(current_signals)}
 配置探针数: {len(current_config)}
 """
+
+    @mcp.tool()
+    def delete_probe_config(probe_id: str) -> str:
+        """删除指定探针的配置，并立即持久化到 ai_config.json。
+
+        此工具用于清理不再使用的探针配置，保持配置文件整洁。
+        删除后，该探针将不再进行阈值检查和告警推送（即使游戏中仍在上报数据）。
+
+        注意：
+          - 删除操作不可逆，但不会影响历史数据库中已保存的记录
+          - 若探针在游戏中仍然存在并上报信号，可通过 get_current_signals 查看实时数据
+          - 若需恢复配置，需手动调用 update_probe_config 重新创建
+
+        Args:
+            probe_id: 要删除的探针配置 ID（配置文件中的 key，如 "furnace_01"）
+
+        Returns:
+            操作结果文本；若 probe_id 不存在则返回提示信息。
+        """
+        try:
+            if probe_id not in current_config:
+                return f"探针 {probe_id} 不存在，无需删除"
+
+            # 删除配置
+            probe_name = current_config[probe_id].get("name", probe_id)
+            del current_config[probe_id]
+
+            # 持久化到文件
+            save_config()
+
+            return f"成功删除探针配置: {probe_id} ({probe_name})"
+        except Exception as e:
+            print(f"删除配置错误: {e}")
+            return f"删除配置失败: {str(e)}"
     
     print("✅ MCP服务器已准备就绪")
     

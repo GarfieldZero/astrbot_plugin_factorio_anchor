@@ -65,7 +65,10 @@ class FactorioAlarmAnchorPlugin(Star):
         return web.json_response({"ok": True, "status": "running"})
 
     async def _handle_alert(self, request: web.Request) -> web.Response:
+        logger.info(f"FactorioAlarmAnchor: 收到告警请求，来源 IP: {request.remote}")
+
         if not self._subscribed_umo:
+            logger.warning("FactorioAlarmAnchor: 告警被拒绝 - 当前未绑定会话")
             return web.json_response(
                 {"ok": False, "error": "当前未绑定会话，请先在目标会话中发送 /alarm_subscribe"},
                 status=400,
@@ -73,17 +76,28 @@ class FactorioAlarmAnchorPlugin(Star):
 
         try:
             payload = await request.json()
+            logger.debug(f"FactorioAlarmAnchor: 收到告警 payload: {payload}")
         except json.JSONDecodeError:
+            logger.error("FactorioAlarmAnchor: 无效的 JSON 请求体")
             return web.json_response({"ok": False, "error": "无效的 JSON 请求体"}, status=400)
         except Exception as exc:
+            logger.exception(f"FactorioAlarmAnchor: 解析请求体时出错：{exc}")
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
         alert = self._normalize_alert(payload)
         if not alert:
+            logger.warning("FactorioAlarmAnchor: 告警数据缺失或格式不正确")
             return web.json_response({"ok": False, "error": "告警数据缺失或格式不正确"}, status=400)
 
-        result_text = await self._process_alert(alert)
-        return web.json_response({"ok": True, "result": result_text})
+        logger.info(f"FactorioAlarmAnchor: 告警规范化完成 - {alert['alert_name']}")
+
+        try:
+            result_text = await self._process_alert(alert)
+            logger.info(f"FactorioAlarmAnchor: 告警处理成功，返回结果长度: {len(result_text)} 字符")
+            return web.json_response({"ok": True, "result": result_text})
+        except Exception as exc:
+            logger.exception(f"FactorioAlarmAnchor: 处理告警时出错：{exc}")
+            return web.json_response({"ok": False, "error": f"处理告警时出错: {str(exc)}"}, status=500)
 
     def _normalize_alert(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(payload, dict):
@@ -107,18 +121,29 @@ class FactorioAlarmAnchorPlugin(Star):
         }
 
     async def _process_alert(self, alert: Dict[str, str]) -> str:
+        logger.info(f"FactorioAlarmAnchor: 开始处理告警 - {alert['alert_name']} (等级: {alert['severity']})")
         history_text = await self._get_session_history(self._subscribed_umo, alert)
+        logger.debug(f"FactorioAlarmAnchor: 获取到会话历史，长度: {len(history_text)} 字符")
+
         llm_text = None
 
         if self._enable_agent_mode:
+            logger.info("FactorioAlarmAnchor: 使用 Agent 模式处理告警")
             llm_text = await self._process_alert_agent(alert, history_text)
         else:
+            logger.info("FactorioAlarmAnchor: 使用文本对话模式处理告警")
             llm_text = await self._process_alert_text_chat(alert, history_text)
+
+        logger.info(f"FactorioAlarmAnchor: LLM 处理完成，响应长度: {len(llm_text) if llm_text else 0} 字符")
 
         message = self._build_push_message(alert, llm_text)
         await self._send_to_subscribed_session(message)
+
         if self._record_alert_history:
-            await self._append_alert_to_history(alert)
+            logger.debug("FactorioAlarmAnchor: 记录告警和响应到会话历史")
+            await self._append_alert_to_history(alert, llm_text)
+
+        logger.info("FactorioAlarmAnchor: 告警处理完成")
         return message
 
     async def _process_alert_text_chat(self, alert: Dict[str, str], history_text: str) -> Optional[str]:
@@ -127,16 +152,24 @@ class FactorioAlarmAnchorPlugin(Star):
             logger.warning("FactorioAlarmAnchor: 获取当前会话 LLM 提供商失败，将直接发送告警摘要")
             return None
         try:
+            prompt = self._build_llm_prompt(alert, history_text)
+            logger.debug(f"FactorioAlarmAnchor: 构建 LLM 提示词，长度: {len(prompt)} 字符")
+
             response = await provider.text_chat(
-                prompt=self._build_llm_prompt(alert, history_text),
+                prompt=prompt,
                 context=[],
                 system_prompt="你是一个运维告警助手，收到游戏告警后要优先判断是否需要提醒用户以及建议下一步操作。请依据告警信息和当前会话历史给出简明结论和建议，返回适合直接发送给用户的中文内容。",
             )
+
+            logger.debug(f"FactorioAlarmAnchor: LLM 响应对象类型: {type(response)}")
+
             llm_text = getattr(response, "completion_text", None)
             if not llm_text:
                 llm_text = getattr(response, "text", None)
             if not llm_text and response is not None:
                 llm_text = str(response)
+
+            logger.info(f"FactorioAlarmAnchor: 文本对话模式 LLM 返回结果: {llm_text[:100] if llm_text else 'None'}...")
             return llm_text
         except Exception as exc:
             logger.exception(f"FactorioAlarmAnchor: 调用 LLM 失败：{exc}")
@@ -145,23 +178,33 @@ class FactorioAlarmAnchorPlugin(Star):
     async def _process_alert_agent(self, alert: Dict[str, str], history_text: str) -> Optional[str]:
         try:
             provider_id = await self.context.get_current_chat_provider_id(self._subscribed_umo)
+            logger.info(f"FactorioAlarmAnchor: 获取到 provider_id: {provider_id}")
         except Exception as exc:
             logger.warning(f"FactorioAlarmAnchor: 获取 provider_id 失败，退回 text_chat：{exc}")
             return await self._process_alert_text_chat(alert, history_text)
 
         try:
             synthetic_event = self._make_synthetic_event(self._subscribed_umo)
+            prompt = self._build_llm_prompt(alert, history_text)
+            logger.debug(f"FactorioAlarmAnchor: 构建 Agent 提示词，长度: {len(prompt)} 字符")
+            logger.info("FactorioAlarmAnchor: 开始调用 tool_loop_agent，max_steps=10，timeout=30")
+
             response = await self.context.tool_loop_agent(
                 event=synthetic_event,
                 chat_provider_id=provider_id,
-                prompt=self._build_llm_prompt(alert, history_text),
+                prompt=prompt,
                 system_prompt="你是一个 Factorio 游戏服务器运维助手。收到告警后，先判断严重程度，再决定是否需要调用 MCP 工具向游戏服务器下发命令（如踢人、暂停、广播消息等）。最终给出简明中文结论和已执行的操作摘要。",
                 max_steps=10,
                 tool_call_timeout=30,
             )
+
+            logger.debug(f"FactorioAlarmAnchor: tool_loop_agent 响应对象类型: {type(response)}")
+
             llm_text = getattr(response, "completion_text", None)
             if not llm_text and response is not None:
                 llm_text = str(response)
+
+            logger.info(f"FactorioAlarmAnchor: Agent 模式 LLM 返回结果: {llm_text[:100] if llm_text else 'None'}...")
             return llm_text
         except Exception as exc:
             logger.exception(f"FactorioAlarmAnchor: Agent 调用失败：{exc}")
@@ -273,17 +316,19 @@ class FactorioAlarmAnchorPlugin(Star):
 
         return lines
 
-    async def _append_alert_to_history(self, alert: Dict[str, str]) -> None:
+    async def _append_alert_to_history(self, alert: Dict[str, str], llm_response: Optional[str] = None) -> None:
         if not self._subscribed_umo:
             return
         try:
             conv_mgr = self.context.conversation_manager
             curr_cid = await conv_mgr.get_curr_conversation_id(self._subscribed_umo)
             if not curr_cid:
+                logger.warning("FactorioAlarmAnchor: 未找到当前会话 ID，无法记录告警")
                 return
 
             conversation = await conv_mgr.get_conversation(self._subscribed_umo, curr_cid)
             if conversation is None:
+                logger.warning("FactorioAlarmAnchor: 未找到会话对象，无法记录告警")
                 return
 
             history_list: List[Dict[str, Any]] = []
@@ -295,16 +340,29 @@ class FactorioAlarmAnchorPlugin(Star):
                 except json.JSONDecodeError:
                     history_list = [{"role": "system", "content": conversation.history}]
 
+            # 添加告警消息（作为 user 角色）
             alert_entry = {
                 "role": "user",
                 "content": f"Factorio 告警：{alert['alert_name']}，等级：{alert['severity']}，来源：{alert['source']}，时间：{alert['timestamp']}，内容：{alert['message']}",
             }
             history_list.append(alert_entry)
+            logger.debug(f"FactorioAlarmAnchor: 添加告警到历史 - {alert['alert_name']}")
+
+            # 如果有 LLM 响应，也添加到历史（作为 assistant 角色）
+            if llm_response:
+                assistant_entry = {
+                    "role": "assistant",
+                    "content": llm_response,
+                }
+                history_list.append(assistant_entry)
+                logger.debug(f"FactorioAlarmAnchor: 添加 LLM 响应到历史，长度: {len(llm_response)} 字符")
+
             await conv_mgr.update_conversation(
                 unified_msg_origin=self._subscribed_umo,
                 conversation_id=curr_cid,
                 history=history_list,
             )
+            logger.info("FactorioAlarmAnchor: 成功记录告警和响应到会话历史")
         except Exception as exc:
             logger.warning(f"FactorioAlarmAnchor: 记录告警到会话历史失败：{exc}")
 
@@ -342,9 +400,13 @@ class FactorioAlarmAnchorPlugin(Star):
             logger.warning("FactorioAlarmAnchor: 未绑定会话，无法推送告警")
             return
 
+        logger.info(f"FactorioAlarmAnchor: 准备推送告警消息到会话: {self._subscribed_umo}")
+        logger.debug(f"FactorioAlarmAnchor: 推送消息内容: {message}")
+
         chain = MessageChain().message(message)
         try:
             await self.context.send_message(self._subscribed_umo, chain)
+            logger.info("FactorioAlarmAnchor: 告警消息推送成功")
         except Exception as exc:
             logger.exception(f"FactorioAlarmAnchor: 发送告警消息失败：{exc}")
 
@@ -378,3 +440,77 @@ class FactorioAlarmAnchorPlugin(Star):
             )
         else:
             yield event.plain_result("当前未绑定任何告警推送会话。请在目标会话中发送 /alarm_subscribe 进行绑定。")
+
+    @filter.command("alarm_test")
+    async def alarm_test(self, event: AstrMessageEvent):
+        """发送一个测试告警以验证插件功能。"""
+        if not self._subscribed_umo:
+            yield event.plain_result("当前未绑定会话，请先使用 /alarm_subscribe 绑定当前会话")
+            return
+
+        if event.unified_msg_origin != self._subscribed_umo:
+            yield event.plain_result(f"当前会话未绑定为告警目标。已绑定会话: {self._subscribed_umo}")
+            return
+
+        logger.info("FactorioAlarmAnchor: 收到测试告警指令")
+        yield event.plain_result("正在发送测试告警...")
+
+        # 构造测试告警
+        test_alert = {
+            "alert_name": "测试告警",
+            "severity": "info",
+            "source": "test_command",
+            "timestamp": "2026-06-21 12:00:00",
+            "message": "这是一个测试告警消息，用于验证插件功能是否正常。",
+        }
+
+        try:
+            result = await self._process_alert(test_alert)
+            logger.info("FactorioAlarmAnchor: 测试告警处理完成")
+            yield event.plain_result(f"测试告警已处理完成\n\n{result}")
+        except Exception as exc:
+            logger.exception(f"FactorioAlarmAnchor: 测试告警处理失败：{exc}")
+            yield event.plain_result(f"测试告警处理失败：{exc}")
+
+    @filter.command("alarm_debug")
+    async def alarm_debug(self, event: AstrMessageEvent):
+        """显示插件调试信息。"""
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        provider_name = provider.__class__.__name__ if provider else "未配置"
+
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+        except:
+            provider_id = "获取失败"
+
+        conv_mgr = self.context.conversation_manager
+        try:
+            curr_cid = await conv_mgr.get_curr_conversation_id(event.unified_msg_origin)
+            conversation = await conv_mgr.get_conversation(event.unified_msg_origin, curr_cid)
+            history_count = 0
+            if conversation and conversation.history:
+                try:
+                    parsed = json.loads(conversation.history)
+                    if isinstance(parsed, list):
+                        history_count = len(parsed)
+                except:
+                    history_count = "解析失败"
+        except:
+            curr_cid = "获取失败"
+            history_count = "获取失败"
+
+        debug_info = (
+            f"【插件调试信息】\n"
+            f"订阅会话: {self._subscribed_umo or '未绑定'}\n"
+            f"当前会话: {event.unified_msg_origin}\n"
+            f"监听端口: {self._alarm_port}\n"
+            f"Agent 模式: {'启用' if self._enable_agent_mode else '禁用'}\n"
+            f"记录历史: {'启用' if self._record_alert_history else '禁用'}\n"
+            f"历史模式: {self._history_mode}\n"
+            f"历史条数: {self._history_count}\n"
+            f"LLM 提供商: {provider_name}\n"
+            f"Provider ID: {provider_id}\n"
+            f"对话 ID: {curr_cid}\n"
+            f"历史记录数: {history_count}\n"
+        )
+        yield event.plain_result(debug_info)
