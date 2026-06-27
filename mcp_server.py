@@ -653,6 +653,179 @@ Unit Number: {config.get('unit_number', '')}
             print(f"删除配置错误: {e}")
             return f"删除配置失败: {str(e)}"
     
+    @mcp.tool()
+    def list_known_signals(from_db: bool = True) -> str:
+        """列出所有已知的信号名称及其所属探针，用于发现当前有哪些可监控的信号。
+
+        Args:
+            from_db: True（默认）从历史数据库查询，覆盖更全；False 仅从当前内存信号查。
+
+        返回每行一个信号：信号名、回路颜色、所属探针名称/unit_number。
+        """
+        try:
+            def probe_name(unit):
+                for v in current_config.values():
+                    if v.get('unit_number') == unit:
+                        return f"{v.get('name', unit)} (unit={unit})"
+                return f"unit={unit}"
+
+            if from_db:
+                conn = sqlite3.connect(DB_FILE)
+                rows = conn.execute(
+                    "SELECT DISTINCT signal_name, signal_type, unit_number FROM signal_history ORDER BY unit_number, signal_type, signal_name"
+                ).fetchall()
+                conn.close()
+                if not rows:
+                    return "数据库中尚无信号记录"
+                return "\n".join(f"{r[0]}  [{r[1]}回路]  探针: {probe_name(r[2])}" for r in rows)
+            else:
+                lines = []
+                for node in current_signals:
+                    unit = node.get('unit_number')
+                    pn = probe_name(unit)
+                    for sig in node.get('red_signals', {}):
+                        lines.append(f"{sig}  [red回路]  探针: {pn}")
+                    for sig in node.get('green_signals', {}):
+                        lines.append(f"{sig}  [green回路]  探针: {pn}")
+                return "\n".join(lines) if lines else "当前没有信号数据"
+        except Exception as e:
+            return f"查询失败: {str(e)}"
+
+    @mcp.tool()
+    def get_signal_value(signal_name: str, unit_number: Optional[int] = None) -> str:
+        """查询指定信号的当前实时值，比 get_current_signals 更精确。
+
+        Args:
+            signal_name: 信号名称，如 "iron-plate"、"signal-red"。
+            unit_number: 可选，限定在某个探针内查找；不填则搜索所有探针。
+
+        返回匹配到的所有探针上该信号的当前值。
+        """
+        results = []
+        for node in current_signals:
+            unit = node.get('unit_number')
+            if unit_number is not None and unit != unit_number:
+                continue
+            probe_name = str(unit)
+            for v in current_config.values():
+                if v.get('unit_number') == unit:
+                    probe_name = v.get('name', str(unit))
+                    break
+            for circuit, label in (('red_signals', 'red'), ('green_signals', 'green')):
+                val = node.get(circuit, {}).get(signal_name)
+                if val is not None:
+                    results.append(f"探针: {probe_name} (unit={unit})  [{label}回路]  {signal_name} = {val}")
+        return "\n".join(results) if results else f"未找到信号: {signal_name}"
+
+    @mcp.tool()
+    def search_probe_config(name_keyword: str) -> str:
+        """按名称关键字模糊搜索探针配置（不区分大小写）。
+
+        当 agent 知道探针的名称关键字但不知道 probe_id 时使用，
+        比逐条翻阅 get_probe_config 更高效。
+
+        Args:
+            name_keyword: 名称关键字，如 "熔炉"、"furnace"。
+        """
+        kw = name_keyword.lower()
+        matches = {k: v for k, v in current_config.items()
+                   if kw in v.get('name', '').lower() or kw in k.lower()}
+        if not matches:
+            return f"未找到名称包含 '{name_keyword}' 的探针"
+        result = []
+        for pid, cfg in matches.items():
+            result.append(
+                f"探针ID: {pid}\n名称: {cfg.get('name','')}\n描述: {cfg.get('description','')}\n"
+                f"Unit Number: {cfg.get('unit_number','')}\n"
+                f"阈值配置: {json.dumps(cfg.get('thresholds', {}), ensure_ascii=False)}"
+            )
+        return "\n---\n".join(result)
+
+    @mcp.tool()
+    def get_history_stats(
+        signal_name: str,
+        unit_number: Optional[int] = None,
+        hours: float = 1.0
+    ) -> str:
+        """查询指定信号在最近 N 小时内的统计数据（最小/最大/平均/最新值）。
+
+        适合快速判断趋势，无需拉取大量原始记录。
+
+        Args:
+            signal_name: 信号名称，如 "iron-plate"。
+            unit_number: 可选，限定探针；不填则统计所有探针上该信号的合并结果。
+            hours:       时间窗口（小时），默认 1.0。
+        """
+        try:
+            since = time.time() - hours * 3600
+            conn = sqlite3.connect(DB_FILE)
+            if unit_number is not None:
+                row = conn.execute(
+                    "SELECT MIN(value),MAX(value),AVG(value),COUNT(*) FROM signal_history WHERE signal_name=? AND unit_number=? AND timestamp>=?",
+                    (signal_name, unit_number, since)
+                ).fetchone()
+                latest = conn.execute(
+                    "SELECT value FROM signal_history WHERE signal_name=? AND unit_number=? ORDER BY timestamp DESC LIMIT 1",
+                    (signal_name, unit_number)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT MIN(value),MAX(value),AVG(value),COUNT(*) FROM signal_history WHERE signal_name=? AND timestamp>=?",
+                    (signal_name, since)
+                ).fetchone()
+                latest = conn.execute(
+                    "SELECT value FROM signal_history WHERE signal_name=? ORDER BY timestamp DESC LIMIT 1",
+                    (signal_name,)
+                ).fetchone()
+            conn.close()
+            if not row or row[3] == 0:
+                return f"最近 {hours} 小时内没有 '{signal_name}' 的记录"
+            probe_info = f"  探针 unit={unit_number}" if unit_number else ""
+            return (f"信号: {signal_name}{probe_info}\n时间窗口: 最近 {hours} 小时\n"
+                    f"最小值: {row[0]}\n最大值: {row[1]}\n平均值: {row[2]:.1f}\n"
+                    f"记录数: {row[3]}\n最新值: {latest[0] if latest else 'N/A'}")
+        except Exception as e:
+            return f"查询失败: {str(e)}"
+
+    @mcp.tool()
+    def delete_history_records(
+        unit_number: Optional[int] = None,
+        signal_name: Optional[str] = None,
+        before_days: Optional[float] = None
+    ) -> str:
+        """从历史数据库删除记录，至少需要提供一个过滤条件。
+
+        Args:
+            unit_number:  按探针 unit_number 过滤（可选）。
+            signal_name:  按信号名精确过滤（可选）。
+            before_days:  删除 N 天前的记录（可选），如 7.0 表示清理 7 天前的数据。
+
+        Returns:
+            删除的记录条数。
+        """
+        if unit_number is None and signal_name is None and before_days is None:
+            return "错误：至少需要提供一个过滤条件（unit_number / signal_name / before_days）"
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            query = "DELETE FROM signal_history WHERE 1=1"
+            params = []
+            if unit_number is not None:
+                query += " AND unit_number=?"
+                params.append(unit_number)
+            if signal_name is not None:
+                query += " AND signal_name=?"
+                params.append(signal_name)
+            if before_days is not None:
+                query += " AND timestamp<?"
+                params.append(time.time() - before_days * 86400)
+            conn.execute(query, params)
+            deleted = conn.execute("SELECT changes()").fetchone()[0]
+            conn.commit()
+            conn.close()
+            return f"已删除 {deleted} 条历史记录"
+        except Exception as e:
+            return f"删除失败: {str(e)}"
+
     print("✅ MCP服务器已准备就绪")
     
     # 使用官方原生支持的 SSE 模式启动服务器
