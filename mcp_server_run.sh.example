@@ -1,0 +1,2 @@
+python3 mcp_server.py --host 0.0.0.0 --port 8081 --alert-url http://123.456.X.X:6191/alert
+#mcp_server使用样例，后面{123.456.X.X:6191}为告警推送地址，不出意外的话应该是ASTRBOT插件设置开放的的端口和地址
